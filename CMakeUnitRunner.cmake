@@ -28,14 +28,6 @@ set (_CMAKE_UNIT_RUNNER_INCLUDED TRUE)
 include (CMakeParseArguments)
 include (CMakeUnit)
 
-# Phase not set, begin PRECONFIGURE phase
-if (NOT _CMAKE_UNIT_PHASE)
-    set (_CMAKE_UNIT_PHASE PRECONFIGURE)
-    include (CTest)
-
-    enable_testing ()
-endif ()
-
 set (CMAKE_POLICY_CACHE_DEFINITIONS
      "--no-warn-unused-cli"
      "-DCMAKE_POLICY_DEFAULT_CMP0054=NEW"
@@ -224,6 +216,8 @@ endfunction ()
 
 function (cmake_unit_init)
 
+    _cmake_unit_current_seconds (START_INIT "cmake_unit_init")
+
     cmake_parse_arguments (CMAKE_UNIT_INIT
                            ""
                            ""
@@ -283,14 +277,18 @@ function (cmake_unit_init)
         # Pass source and binary directory to test here as it will be the same
         # for all phases and we can use the directories in per-test variables
         # easily.
+        _cmake_unit_current_seconds (START "${FUNCTION}")
         _cmake_unit_call_function (${FUNCTION}
                                    SOURCE_DIR "${TEST_SOURCE_DIR}"
                                    BINARY_DIR "${TEST_BINARY_DIR}")
+        _cmake_unit_seconds_delta (${START} "${FUNCTION}" DELTA)
 
     endforeach ()
 
     unset (_CMAKE_UNIT_PHASE)
     unset (_CMAKE_UNIT_ACTIVE_TEST)
+
+    _cmake_unit_seconds_delta (${START_INIT} "cmake_unit_init" DELTA_INIT)
 
 endfunction ()
 
@@ -355,6 +353,10 @@ function (_cmake_unit_get_child_invocation_script_header HEADER_RETURN)
          "set (CMAKE_UNIT_COVERAGE_FILE \"${CMAKE_UNIT_COVERAGE_FILE}\"\n"
          "     CACHE STRING \"\" FORCE)\n"
          "set (CMAKE_GENERATOR \"${CMAKE_GENERATOR}\")\n"
+         "set (_CMAKE_UNIT_LINE_FILTER_PROG_PATH\n"
+         "     \"${_CMAKE_UNIT_LINE_FILTER_PROG_PATH}\")\n"
+         "set (_CMAKE_UNIT_FIND_WARNINGS_PATH\n"
+         "     \"${_CMAKE_UNIT_FIND_WARNINGS_PATH}\")\n"
          ${DISPATCH_TABLE_PROP_LINE}
          ${DISCOVERED_TESTS_PROP_LINE}
          PARENT_SCOPE)
@@ -423,6 +425,7 @@ function (_cmake_unit_preconfigure_test)
           ${COMMON_PROLOGUE}
           "set (_CMAKE_UNIT_PHASE UTILITY)\n"
           "include (\"${_RUNNER_LIST_FILE}\")\n"
+          "_cmake_unit_current_seconds (START_TEST \"Driver script - invoke for ${TEST_NAME}\" )\n"
           "_cmake_unit_invoke_command (COMMAND \"${CMAKE_COMMAND}\"\n"
           "                                    ${POLICY_CACHE_DEFS_SPACIFIED}\n"
           "                                    -P \"${DRIVER_SCRIPT}\"\n"
@@ -430,16 +433,20 @@ function (_cmake_unit_preconfigure_test)
           "                            OUTPUT_FILE \"${DRIVER_OUTPUT_LOG}\"\n"
           "                            ERROR_FILE \"${DRIVER_ERROR_LOG}\"\n"
           "                            PHASE DRIVER)\n"
+          "_cmake_unit_seconds_delta (\${START_TEST} \"Driver script - invoke for ${TEST_NAME}\" TEST_DELTA)\n"
           "set (LOG_COVERAGE \"${CMAKE_UNIT_COVERAGE_FILE}\")\n"
           "if (LOG_COVERAGE)\n"
-          "    file (STRINGS \"${DRIVER_ERROR_LOG}\" TRACE_LINES)\n"
+          "    _cmake_unit_current_seconds (START_DRIVER_COV \"Log driver coverage - invoke for ${TEST_NAME}\")\n"
+          "    _cmake_unit_current_seconds (START_DRIVER_COV \"Invoke filter trace - invoke for ${TEST_NAME}\")\n"
           "    _cmake_unit_filter_trace_lines (FILTERED_LINES\n"
           "                                    TEST_NAME \"${TEST_NAME}\"\n"
-          "                                    TRACE_LINES \${TRACE_LINES}\n"
+          "                                    TRACE_LINES_FILE \"\${DRIVER_ERROR_LOG}\"\n"
           "                                    COVERAGE_FILES\n"
           "                                    ${COVERAGE_FILES})\n"
+          "    _cmake_unit_seconds_delta (\${START_DRIVER_COV} \"Invoke filter trace - invoke for ${TEST_NAME}\" TEST_DELTA)\n"
           "    file (APPEND \"${ABSOLUTE_COVERAGE_FILE_PATH}\"\n"
           "          \${FILTERED_LINES})\n"
+          "    _cmake_unit_seconds_delta (\${START_DRIVER_COV} \"Log driver coverage - invoke for ${TEST_NAME}\" TEST_DELTA)\n"
           "${END}if ()\n")
 
     # The test step invokes the script at the INVOKE_CONFIGURE
@@ -490,54 +497,428 @@ function (_cmake_unit_remove_problematic_regex PHASE
 
 endfunction ()
 
+function (_cmake_unit_get_progs_dir NAME
+                                    SOURCE_DIR_RETURN
+                                    BINARY_DIR_RETURN
+                                    EXPORTS_FILE_RETURN)
+
+    set (SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_cmake_unit_internal/${NAME}")
+    set (BINARY_DIR "${SOURCE_DIR}/build")
+    set (EXPORTS_FILE "${BINARY_DIR}/exports.cmake")
+    file (MAKE_DIRECTORY "${SOURCE_DIR}")
+    file (MAKE_DIRECTORY "${BINARY_DIR}")
+
+    set (${SOURCE_DIR_RETURN} "${SOURCE_DIR}" PARENT_SCOPE)
+    set (${BINARY_DIR_RETURN} "${BINARY_DIR}" PARENT_SCOPE)
+    set (${EXPORTS_FILE_RETURN} "${EXPORTS_FILE}" PARENT_SCOPE)
+
+endfunction ()
+
+function (_cmake_unit_write_newer_file)
+
+    set (WRITE_IF_THIS_FILE_NEWER_SINGLEVAR_ARGS FILE)
+    set (WRITE_IF_THIS_FILE_NEWER_MULTIVAR_ARGS CONTENTS)
+
+    cmake_parse_arguments (WRITE_IF_THIS_FILE_NEWER
+                           ""
+                           "${WRITE_IF_THIS_FILE_NEWER_SINGLEVAR_ARGS}"
+                           "${WRITE_IF_THIS_FILE_NEWER_MULTIVAR_ARGS}"
+                           ${ARGN})
+
+    # Previously written files are considered invalid when the current
+    # (eg, this file) cmake file is newer than the currently written file
+    # if it exists.
+    file (TIMESTAMP "${_RUNNER_LIST_FILE}" RUNNER_TIMESTAMP "%Y%j%H%M%S" UTC)
+    file (TIMESTAMP "${WRITE_IF_THIS_FILE_NEWER_FILE}"
+                    TARGET_TIMESTAMP
+                    "%Y%j%H%M%S"
+                    UTC)
+
+    if (NOT EXISTS "${WRITE_IF_THIS_FILE_NEWER_FILE}" OR
+        "${TARGET_TIMESTAMP}" LESS "${RUNNER_TIMESTAMP}")
+
+        # Convert ;\n to \n before writing, so that we can write as a string
+        # and keep the existing semicolons in tact
+        string (REPLACE "\n;" "\n" CONTENTS
+                "${WRITE_IF_THIS_FILE_NEWER_CONTENTS}")
+
+        file (WRITE "${WRITE_IF_THIS_FILE_NEWER_FILE}" "${CONTENTS}")
+
+    endif ()
+
+endfunction ()
+
+function (_cmake_unit_generate_int_target PROG_NAME EXPORTS_FILE_RETURN)
+
+    set (GENERATE_PROG_SINGLEVAR_ARGS DESCRIPTION TYPE)
+    set (GENERATE_PROG_MULTIVAR_ARGS SOURCE_CONTENTS
+                                     HEADER_CONTENTS
+                                     LINK_LIBRARIES
+                                     IMPORTS)
+
+    cmake_parse_arguments (GENERATE_PROG
+                           ""
+                           "${GENERATE_PROG_SINGLEVAR_ARGS}"
+                           "${GENERATE_PROG_MULTIVAR_ARGS}"
+                           ${ARGN})
+
+    _cmake_unit_get_progs_dir ("${PROG_NAME}"
+                               SOURCE_DIR
+                               BINARY_DIR
+                               EXPORTS_FILE)
+
+    set (SOURCE_FILE "${SOURCE_DIR}/${PROG_NAME}.c")
+    set (HEADER_FILE "${SOURCE_DIR}/${PROG_NAME}.h")
+    set (CMAKELISTS_TXT "${SOURCE_DIR}/CMakeLists.txt")
+    set (EXPORTS_FILE "${BINARY_DIR}/exports.cmake")
+
+    _cmake_unit_runner_assert (CONDITION
+                               GENERATE_PROG_TYPE STREQUAL "EXECUTABLE" OR
+                               GENERATE_PROG_TYPE STREQUAL "LIBRARY")
+
+    if (GENERATE_PROG_TYPE STREQUAL "EXECUTABLE")
+
+        set (CMAKELISTS_TXT_TARGET_LINE "add_executable (${PROG_NAME}")
+
+    elseif (GENERATE_PROG_TYPE STREQUAL "LIBRARY")
+
+        set (CMAKELISTS_TXT_TARGET_LINE "add_library (${PROG_NAME} SHARED")
+
+    endif ()
+
+    set (CMAKELISTS_TXT_CONTENTS
+         "cmake_minimum_required (VERSION 2.8)\n"
+         "project (cmake_unit_${PROG_NAME})\n")
+
+    foreach (IMPORT_FILE ${GENERATE_PROG_IMPORTS})
+
+        list (APPEND CMAKELISTS_TXT_CONTENTS "include (\"${IMPORT_FILE}\")\n")
+
+    endforeach ()
+
+    if (GENERATE_PROG_LINK_LIBRARIES)
+
+        set (PROG_TARGET_LINK_LIBRARIES_LINE
+             "target_link_libraries (${PROG_NAME}\n"
+             "                       PUBLIC ${GENERATE_PROG_LINK_LIBRARIES})")
+
+    endif ()
+
+    list (APPEND CMAKELISTS_TXT_CONTENTS
+          "${CMAKELISTS_TXT_TARGET_LINE} \"${SOURCE_FILE}\")\n"
+          "set_target_properties (${PROG_NAME}\n"
+          "                       PROPERTIES\n"
+          "                       INCLUDE_DIRECTORIES\n"
+          "                       \"${SOURCE_DIR}\"\n"
+          "                       INTERFACE_INCLUDE_DIRECTORIES\n"
+          "                       \"${SOURCE_DIR}\")\n"
+          "${PROG_TARGET_LINK_LIBRARIES_LINE}\n"
+          "export (TARGETS ${PROG_NAME}\n"
+          "        FILE \"${EXPORTS_FILE}\")\n")
+
+    _cmake_unit_write_newer_file (FILE "${SOURCE_FILE}"
+                                  CONTENTS ${GENERATE_PROG_SOURCE_CONTENTS})
+    _cmake_unit_write_newer_file (FILE "${HEADER_FILE}"
+                                  CONTENTS ${GENERATE_PROG_HEADER_CONTENTS})
+    _cmake_unit_write_newer_file (FILE "${CMAKELISTS_TXT}"
+                                  CONTENTS ${CMAKELISTS_TXT_CONTENTS})
+
+    # Now build the project inside of the specified binary dir
+    execute_process (COMMAND "${CMAKE_COMMAND}"
+                             "${SOURCE_DIR}"
+                             ${CMAKE_POLICY_CACHE_DEFINITIONS}
+                     OUTPUT_VARIABLE CONFIGURE_OUTPUT
+                     ERROR_VARIABLE CONFIGURE_ERROR
+                     WORKING_DIRECTORY
+                     "${BINARY_DIR}"
+                     RESULT_VARIABLE CONFIGURE_RESULT)
+
+    execute_process (COMMAND "${CMAKE_COMMAND}"
+                             --build
+                             "${BINARY_DIR}"
+                     OUTPUT_VARIABLE BUILD_OUTPUT
+                     ERROR_VARIABLE BUILD_ERROR
+                     RESULT_VARIABLE BUILD_RESULT)
+
+    if (NOT ${BUILD_RESULT} EQUAL 0 OR NOT ${CONFIGURE_RESULT} EQUAL 0)
+
+        message ("${CONFIGURE_OUTPUT}\n"
+                 "${CONFIGURE_ERROR}\n"
+                 "${BUILD_OUTPUT}\n"
+                 "${BUILD_ERROR}\n")
+        message (FATAL_ERROR
+                 "Configuring the ${GENERATE_PROG_DESCRIPTION} failed\n"
+                 "Configure Result: ${CONFIGURE_RESULT}\n"
+                 "Build Result: ${BUILD_RESULT}\n")
+
+    else ()
+
+        message (STATUS "Built ${GENERATE_PROG_DESCRIPTION}")
+
+    endif ()
+
+    file (READ "${EXPORTS_FILE}" EXPORTS_FILE_CONTENTS)
+    set (${EXPORTS_FILE_RETURN} "${EXPORTS_FILE}" PARENT_SCOPE)
+
+endfunction ()
+
+function (_cmake_unit_generate_filter_library FILTER_LIBRARY_EXPORTS_RETURN)
+
+    set (HEADER_FILE_CONTENTS
+         "#ifndef _CMAKE_UNIT_FILTER_LIBRARY_H\n"
+         "#define _CMAKE_UNIT_FILTER_LIBRARY_H\n"
+         "\n"
+         "#include <stdlib.h>\n"
+         "\n"
+         "char * read_file (const char *, size_t *)\;\n"
+         "void write_to (const char *, const char *, size_t)\;\n"
+         "char * allocate_print_buffer (char *, size_t, size_t)\;\n"
+         "typedef int (*ForEachLine)(const char *, void *)\;\n"
+         "void for_each_line (char *, ForEachLine, void *)\;\n"
+         "typedef int (*Filter)(const char *)\;\n"
+         "typedef size_t (*Print)(char *, const char *, void *)\;\n"
+         "size_t fill_print_buffer (char *, char *, Filter, Print, void *)\;\n"
+         "#endif\n")
+    set (SOURCE_FILE_CONTENTS
+         "#include <ctype.h>\n"
+         "#include <stdio.h>\n"
+         "#include <stdlib.h>\n"
+         "#include <string.h>\n"
+         "#include <filter_library.h>\n"
+         "char * read_file (const char *filename, unsigned long *len)\n"
+         "{\n"
+         "    FILE *lines_file = fopen (filename, \"r\")\;\n"
+         "\n"
+         "    fseek (lines_file, 0, SEEK_END)\;\n"
+         "    unsigned long lines_len = ftell (lines_file)\;\n"
+         "    rewind (lines_file)\;\n"
+         "\n"
+         "    char *lines_contents = malloc (sizeof (char) * lines_len)\;\n"
+         "    fread (lines_contents, sizeof(char), lines_len,\n"
+         "           lines_file)\;\n"
+         "    fclose (lines_file)\;\n"
+         "    return lines_contents\;\n"
+         "}\n"
+         "\n"
+         "void write_to (const char *desc,\n"
+         "               const char *msg,\n"
+         "               size_t     len)\n"
+         "{\n"
+         "    if (strcmp (desc, \"OUTPUT\") == 0)\n"
+         "        fprintf (stdout, \"%s\", msg)\;\n"
+         "    else if (strcmp (desc, \"ERROR\") == 0)\n"
+         "        fprintf (stderr, \"%s\", msg)\;\n"
+         "}\n"
+         "\n"
+         "char * allocate_print_buffer (char   *lines_contents,\n"
+         "                              size_t lines_len,\n"
+         "                              size_t extra)\n"
+         "{\n"
+         "    size_t i = 0\;\n"
+         "    size_t buffer_len = lines_len\;\n"
+         "    for (\; i < lines_len\; ++i)\n"
+         "        buffer_len += (lines_contents[i] == '\\n' ? extra : 0)\;\n"
+         "    char *buffer = calloc (1, sizeof (char) * buffer_len)\;\n"
+         "    return buffer\;\n"
+         "}\n"
+         "\n"
+         "void for_each_line (char        *body,\n"
+         "                    ForEachLine func,\n"
+         "                    void        *user_data)\n"
+         "{\n"
+         "    char *line = NULL\;\n"
+         "    while ((line = strsep (&body, \"\\n\")) != NULL)\n"
+         "        if (!func (line, user_data))\n"
+         "            return\;\n"
+         "}\n"
+         "\n"
+         "typedef int (*FilterFunction)(const char *)\;\n"
+         "typedef size_t (*PrintFunction)(char *, const char *, void *)\;\n"
+         "\n"
+         "typedef struct _FillPrintBufferUserData \n"
+         "{\n"
+         "    FilterFunction filter\;\n"
+         "    PrintFunction  print\;\n"
+         "    void           *print_data\;\n"
+         "    char           *buffer\;\n"
+         "    size_t         offset\;\n"
+         "} FillPrintBufferUserData\;\n"
+         "\n"
+         "static int fill_print_buffer_foreach_func (char *line, void *data)\n"
+         "{\n"
+         "    FillPrintBufferUserData *fill = data\;\n"
+         "    if (strlen (line) && fill->filter (line))\n"
+         "        fill->offset += fill->print (&(fill->buffer[fill->offset]),\n"
+         "                                     line,\n"
+         "                                     fill->print_data)\;\n"
+         "    return 1\;\n"
+         "}\n"
+         "\n"
+         "size_t fill_print_buffer (char           *print_buffer,\n"
+         "                          char           *lines_contents,\n"
+         "                          FilterFunction filter,\n"
+         "                          PrintFunction  print,\n"
+         "                          void           *print_user_data)\n"
+         "{\n"
+         "    FillPrintBufferUserData data = {\n"
+         "        filter,\n"
+         "        print,\n"
+         "        print_user_data,\n"
+         "        print_buffer,\n"
+         "        0\n"
+         "    }\;\n"
+         "\n"
+         "    for_each_line (lines_contents,\n"
+         "                   fill_print_buffer_foreach_func,\n"
+         "                   &data)\;\n"
+         "    return data.offset\;\n"
+         "}\n")
+
+    _cmake_unit_generate_int_target (filter_library
+                                     FILTER_LIBRARY_EXPORTS_FILE
+                                     TYPE LIBRARY
+                                     SOURCE_CONTENTS ${SOURCE_FILE_CONTENTS}
+                                     HEADER_CONTENTS ${HEADER_FILE_CONTENTS}
+                                     DESCRIPTION "line filter base library")
+    set (${FILTER_LIBRARY_EXPORTS_RETURN} "${FILTER_LIBRARY_EXPORTS_FILE}"
+         PARENT_SCOPE)
+
+endfunction ()
+
+function (_cmake_unit_generate_find_warnings_prog FILTER_LIB_EXPORT_FILE
+                                                  FIND_WARNINGS_PROG_RETURN)
+
+    set (SOURCE_FILE_CONTENTS
+         "#include <string.h>\n"
+         "#include <filter_library.h>\n"
+         "#include <stdio.h>\n"
+         "static const char *warning_text = \"CMake Warning\"\;\n"
+         "static size_t warning_len = 0\;\n"
+         "static int warning_detected = 0\;\n"
+         "static int is_warning (const char *line, void *data)\n"
+         "{\n"
+         "    if (strncmp (warning_text, line, warning_len) == 0)\n"
+         "    {\n"
+         "        warning_detected = 1\;\n"
+         "        return 0\;\n"
+         "    }\n"
+         "    return 1\;\n"
+         "}\n"
+         "\n"
+         "int main (int argc, char **argv)\n"
+         "{\n"
+         "    warning_len = strlen (warning_text)\;\n"
+         "    const char *log_filename = argv[1]\;\n"
+         "    size_t      log_filename_len\;\n"
+         "    char *contents = read_file (log_filename, &log_filename_len)\;\n"
+         "    for_each_line (contents, is_warning, NULL)\;\n"
+         "    return warning_detected\;\n"
+         "}\n")
+
+    _cmake_unit_generate_int_target (warning_detector
+                                     EXPORTS_FILE
+                                     TYPE EXECUTABLE
+                                     SOURCE_CONTENTS ${SOURCE_FILE_CONTENTS}
+                                     IMPORTS "${FILTER_LIB_EXPORT_FILE}"
+                                     LINK_LIBRARIES filter_library
+                                     DESCRIPTION "warning detector")
+    cmake_unit_get_target_location_from_exports ("${EXPORTS_FILE}"
+                                                 "${CMAKE_CURRENT_BINARY_DIR}"
+                                                 warning_detector
+                                                 ERROR_FILE_FILTER_BINARY)
+    set (${FIND_WARNINGS_PROG_RETURN} "${ERROR_FILE_FILTER_BINARY}"
+         PARENT_SCOPE)
+
+endfunction ()
+
+function (_cmake_unit_generate_filter_out_prog FILTER_LIBRARY_EXPORTS_FILE
+                                               ERROR_FILE_FILTER_BINARY_RETURN)
+
+    set (SOURCE_FILE_CONTENTS
+         "#include <filter_library.h>\n"
+         "#include <stdio.h>\n"
+         "int is_not_traceline(const char *line)\n"
+         "{\n"
+         "    char *line_indicator = strstr (line, \"):  \")\;\n"
+         "    if (line_indicator && isdigit (*(line_indicator - 1)))\n"
+         "        return 0\;\n"
+         "    return 1\;\n"
+         "}\n"
+         "\n"
+         "typedef struct _PrintLineWithTagsData\n"
+         "{\n"
+         "    const char *type\;\n"
+         "    const char *phase\;\n"
+         "    size_t     header_len\;\n"
+         "} PrintLineWithTagsData\;\n"
+         "\n"
+         "size_t print_with_tags (char *print_buffer,\n"
+         "                        const char *line,\n"
+         "                        void *user_data)\n"
+         "{\n"
+         "    PrintLineWithTagsData *tags_data = user_data\;\n"
+         "    sprintf (print_buffer,\n"
+         "             \"-- %s %s %s\\n\",\n"
+         "             tags_data->phase,\n"
+         "             tags_data->type,\n"
+         "             line)\;\n"
+         "    return strlen (line) + tags_data->header_len\;\n"
+         "}\n"
+         "\n"
+         "int main (int argc, char **argv)\n"
+         "{\n"
+         "    const char *lines_filename = argv[1]\;\n"
+         "    size_t phase_prefix_len = strlen (argv[2])\;"
+         "    size_t type_prefix_len = strlen (argv[3])\;\n"
+         "    size_t line_hdr_len = phase_prefix_len +\n"
+         "                          type_prefix_len + 6\;\n"
+         "    size_t lines_file_len\;\n"
+         "    char *lines_contents = read_file (lines_filename,\n"
+         "                                      &lines_file_len)\;\n"
+
+         "    char   *print_buffer = allocate_print_buffer (lines_contents,\n"
+         "                                                  lines_file_len,\n"
+         "                                                  line_hdr_len)\;\n"
+         "    PrintLineWithTagsData tags_data = {\n"
+         "        argv[3],\n"
+         "        argv[2],\n"
+         "        line_hdr_len\n"
+         "    }\;\n"
+         "    size_t amount_printed = fill_print_buffer (print_buffer,\n"
+         "                                               lines_contents,\n"
+         "                                               is_not_traceline,\n"
+         "                                               print_with_tags,\n"
+         "                                               &tags_data)\;\n"
+         "    write_to (argv[3], print_buffer, amount_printed)\;\n"
+         "    return 0\;\n"
+         "}\n")
+
+    _cmake_unit_generate_int_target (error_file_filter
+                                     EXPORTS_FILE
+                                     TYPE EXECUTABLE
+                                     SOURCE_CONTENTS ${SOURCE_FILE_CONTENTS}
+                                     IMPORTS "${FILTER_LIBRARY_EXPORTS_FILE}"
+                                     LINK_LIBRARIES filter_library
+                                     DESCRIPTION "error file filter")
+    cmake_unit_get_target_location_from_exports ("${EXPORTS_FILE}"
+                                                 "${CMAKE_CURRENT_BINARY_DIR}"
+                                                 error_file_filter
+                                                 ERROR_FILE_FILTER_BINARY)
+    set (${ERROR_FILE_FILTER_BINARY_RETURN} "${ERROR_FILE_FILTER_BINARY}"
+         PARENT_SCOPE)
+
+endfunction ()
+
 function (_cmake_unit_print_lines_for_log PHASE
                                           LOG_TYPE
                                           LOG_FILE)
 
-    file (STRINGS "${LOG_FILE}" LINES)
-
-    set (FILTER_PRINTED_LINES OFF)
-    if (PHASE STREQUAL INVOKE_CONFIGURE OR
-        PHASE STREQUAL DRIVER)
-
-        set (FILTER_PRINTED_LINES ON)
-
-    endif ()
-
-    # Print error lines to stderr and output lines to stdout, mimicing the
-    # same format for each
-    if (LOG_TYPE STREQUAL "ERROR")
-
-        set (MESSAGE_INITIAL_ARGS "-- ")
-
-    elseif (LOG_TYPE STREQUAL "OUTPUT")
-
-        set (MESSAGE_INITIAL_ARGS STATUS)
-
-    endif ()
-
-    # Attempt to filter out trace-file like lines
-    if (FILTER_PRINTED_LINES AND LOG_TYPE STREQUAL ERROR)
-
-        foreach (LINE ${LINES})
-
-            if (NOT LINE MATCHES "^.+\\([0-9]+\\):  .+$")
-
-                message (${MESSAGE_INITIAL_ARGS} "${PHASE} ERROR ${LINE}")
-
-            endif ()
-
-        endforeach ()
-
-    else ()
-
-        foreach (LINE ${LINES})
-
-            message (${MESSAGE_INITIAL_ARGS} "${PHASE} ${LOG_TYPE} ${LINE}")
-
-        endforeach ()
-
-    endif ()
+    _cmake_unit_current_seconds (START "1")
+    execute_process (COMMAND "${_CMAKE_UNIT_LINE_FILTER_PROG_PATH}"
+                             "${LOG_FILE}"
+                             "${PHASE}"
+                             "${LOG_TYPE}")
+    _cmake_unit_seconds_delta (${START} "printing lines" TIME)
 
 endfunction ()
 
@@ -585,13 +966,6 @@ function (_cmake_unit_invoke_command)
 
         if (LOG_FILE AND EXISTS "${LOG_FILE}")
 
-            # HACK: Remove square brackets as their presence can confuse
-            # CMake into not using ; as a list delimiter. We can't even use
-            # the character here as it will cause confusion in coverage mode.
-            _cmake_unit_remove_problematic_regex (${INVOKE_COMMAND_PHASE}
-                                                  ${LOG_TYPE}
-                                                  "${LOG_FILE}"
-                                                  "${LOG_FILE}")
             _cmake_unit_print_lines_for_log (${INVOKE_COMMAND_PHASE}
                                              ${LOG_TYPE}
                                              "${LOG_FILE}")
@@ -698,18 +1072,16 @@ function (cmake_unit_invoke_configure)
     # is not very efficient, but it makes for slightly neater code.
     if (NOT INVOKE_CONFIGURE_ALLOW_WARNINGS)
 
-        file (STRINGS "${INVOKE_CONFIGURE_ERROR_FILE}" CONFIGURE_ERROR_LINES)
-        foreach (LINE ${CONFIGURE_ERROR_LINES})
+        _cmake_unit_current_seconds (START "filtering warnings")
+        execute_process (COMMAND "${_CMAKE_UNIT_FIND_WARNINGS_PATH}"
+                                 "${INVOKE_CONFIGURE_ERROR_FILE}"
+                         RESULT_VARIABLE RESULT)
+        _cmake_unit_seconds_delta (${START} "filtering warnings" TIME)
+        if (NOT RESULT EQUAL 0)
 
-            if (LINE MATCHES "^CMake Warning.*")
+            message (SEND_ERROR "CMake Warnings were present ${RESULT}!\n")
 
-                message (STATUS "${LINE}")
-                message (SEND_ERROR
-                         "CMake Warnings were present!")
-
-            endif ()
-
-        endforeach ()
+        endif ()
 
     endif ()
 
@@ -784,13 +1156,46 @@ function (cmake_unit_invoke_test)
 
 endfunction ()
 
+function (_cmake_unit_current_seconds TIME_RET NAME)
+
+    string (TIMESTAMP SECONDS "%S" UTC)
+    string (TIMESTAMP MINUTES "%M" UTC)
+
+    math (EXPR START_OP_TIME "(${MINUTES} * 60) + ${SECONDS}")
+
+    if (NOT NAME STREQUAL "1")
+    message (STATUS "STARTING OP ${NAME} ... ${START_OP_TIME}")
+    endif()
+
+    set (${TIME_RET} ${START_OP_TIME} PARENT_SCOPE)
+
+endfunction ()
+
+function (_cmake_unit_seconds_delta START NAME DELTA_RET)
+
+    _cmake_unit_current_seconds (END "1")
+
+    math (EXPR DELTA "${END} - ${START}")
+
+    if (NOT NAME STREQUAL "1")
+    message (STATUS "FINISHING OP ${NAME} ... ${END} : ${DELTA}")
+    endif()
+
+    set (${DELTA_RET} ${DELTA} PARENT_SCOPE)
+
+endfunction ()
+
 function (_cmake_unit_filter_trace_lines FILTERED_LINES)
+
+    _cmake_unit_current_seconds (START "_cmake_unit_filter_trace_lines")
+    _cmake_unit_current_seconds (START_PARSE "_cmake_unit_filter_trace_lines - parse arguments")
 
     cmake_parse_arguments (FILTER_COVERAGE
                            ""
                            "TEST_NAME"
-                           "TRACE_LINES;COVERAGE_FILES"
+                           "TRACE_LINES_FILE;COVERAGE_FILES"
                            ${ARGN})
+    _cmake_unit_seconds_delta (${START_PARSE} "_cmake_unit_filter_trace_lines - parse arguments" TIME)
 
     set (COVERAGE_FILE_CONTENTS "")
     list (APPEND COVERAGE_FILE_CONTENTS "TEST:${TEST_NAME}\n")
@@ -800,6 +1205,9 @@ function (_cmake_unit_filter_trace_lines FILTERED_LINES)
 
     endforeach ()
 
+    _cmake_unit_current_seconds (START_FILTER "_cmake_unit_filter_trace_lines - filter lines")
+
+    file (STRINGS "${FILTER_COVERAGE_TRACE_LINES_FILE}" FILTER_COVERAGE_TRACE_LINES)
     foreach (LINE ${FILTER_COVERAGE_TRACE_LINES})
 
         # Search for lines matching a trace pattern
@@ -830,6 +1238,8 @@ function (_cmake_unit_filter_trace_lines FILTERED_LINES)
         endforeach ()
 
     endforeach ()
+    _cmake_unit_seconds_delta (${START_FILTER} "_cmake_unit_filter_trace_lines - filter lines" TIME)
+    _cmake_unit_seconds_delta (${START} "_cmake_unit_filter_trace_lines" TIME)
 
     set (${FILTERED_LINES} ${COVERAGE_FILE_CONTENTS} PARENT_SCOPE)
 
@@ -858,16 +1268,14 @@ function (_cmake_unit_coverage)
 
         if (EXISTS "${ERROR_LOG_FILE}")
 
-            file (STRINGS "${ERROR_LOG_FILE}" ERROR_LOG)
-
             get_property (COVERAGE_FILES
                           GLOBAL PROPERTY _CMAKE_UNIT_COVERAGE_LOGGING_FILES)
 
             _cmake_unit_filter_trace_lines (COVERAGE_FILE_CONTENTS
                                             TEST_NAME
                                             "${COVERAGE_PHASE_TEST_NAME}"
-                                            TRACE_LINES
-                                            "${ERROR_LOG}"
+                                            TRACE_LINES_FILE
+                                            "${ERROR_LOG_FILE}"
                                             COVERAGE_FILES ${COVERAGE_FILES})
 
             # Use relative path
@@ -1158,6 +1566,7 @@ set (_CMAKE_UNIT_PHASE_AFTER_VERIFY COVERAGE) # NOLINT:unused/private_var
 
 function (_cmake_unit_configure_test_internal)
 
+    _cmake_unit_current_seconds (START_CONFIG_INT "_cmake_unit_configure_test_internal ${_CMAKE_UNIT_PHASE}")
     set (CMAKE_UNIT_CONFIGURE_TEST_SINGLEVAR_ARGS SOURCE_DIR BINARY_DIR)
 
     set (CMAKE_UNIT_PHASES PRECONFIGURE
@@ -1209,6 +1618,8 @@ function (_cmake_unit_configure_test_internal)
                                BINARY_DIR "${TEST_BINARY_DIR}"
                                OUTPUT_FILE "${TEST_BINARY_DIR}/${PHASE}.output"
                                ERROR_FILE "${TEST_BINARY_DIR}/${PHASE}.error")
+    _cmake_unit_seconds_delta (${START} "${PHASE_FUNCTION}" DELTA)
+    _cmake_unit_seconds_delta (${START_CONFIG_INT} "_cmake_unit_configure_test_internal ${_CMAKE_UNIT_PHASE}" DELTA_PHASE)
 
     # Implicitly dereference _CMAKE_UNIT_PHASE_AFTER_${PHASE} and if there's
     # a phase to go to, recursively call this function and enter the next phase.
@@ -1283,3 +1694,18 @@ function (cmake_unit_get_log_for PHASE LOG_TYPE LOG_FILE_RETURN)
          PARENT_SCOPE)
 
 endfunction ()
+
+# Phase not set, begin PRECONFIGURE phase
+if (NOT _CMAKE_UNIT_PHASE)
+    set (_CMAKE_UNIT_PHASE PRECONFIGURE)
+    include (CTest)
+
+    enable_testing ()
+
+    _cmake_unit_generate_filter_library (_CMAKE_UNIT_FILTER_LIB_EXPORTS)
+    _cmake_unit_generate_filter_out_prog ("${_CMAKE_UNIT_FILTER_LIB_EXPORTS}"
+                                          _CMAKE_UNIT_LINE_FILTER_PROG_PATH)
+    _cmake_unit_generate_find_warnings_prog ("${_CMAKE_UNIT_FILTER_LIB_EXPORTS}"
+                                             _CMAKE_UNIT_FIND_WARNINGS_PATH)
+
+endif ()

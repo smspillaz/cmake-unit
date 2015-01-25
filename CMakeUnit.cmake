@@ -521,6 +521,7 @@ endfunction ()
 # will resolve all those issues.
 #
 # EXPORTS: Full path to EXPORTS file to read
+# BINARY_DIR: Binary dir to put temporary files in
 # TARGET: Name of TARGET as it will be found in the EXPORTS file
 # LOCATION_RETURN: Variable to write target's LOCATION property into.
 function (cmake_unit_get_target_location_from_exports EXPORTS
